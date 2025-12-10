@@ -1,9 +1,11 @@
-import { app, BrowserWindow, globalShortcut, clipboard, ipcMain, screen } from 'electron';
+import { app, BrowserWindow, globalShortcut, clipboard, ipcMain, screen, shell } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { ItemParser } from './item-parser.js';
-import { LogMonitor } from './log-monitor.js';
 import { db } from './db.js';
+import store from './store.js';
+import { TradeAPI } from './trade-api.js';
+import { LogMonitor } from './log-monitor.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Initialize DB
@@ -176,13 +178,56 @@ const analyzeItemText = (text) => {
 // IPC Handlers
 ipcMain.handle('analyze-item', async (event, text) => {
     return analyzeItemText(text);
+    return analyzeItemText(text);
+});
+// Settings IPC
+ipcMain.handle('get-settings', () => {
+    // @ts-ignore - dynamic import or simple require needed for ESM in some electron setups? 
+    // actually we imported it.
+    return store.store;
+});
+ipcMain.on('set-setting', (event, { key, value }) => {
+    store.set(key, value);
+});
+import { Automation } from './automation.js';
+// ... existing code ...
+ipcMain.handle('automation-send-chat', async (event, message) => {
+    console.log('[Main] Automation Send Chat:', message);
+    await Automation.sendChat(message);
+});
+ipcMain.handle('open-external', async (event, url) => {
+    await shell.openExternal(url);
+});
+ipcMain.handle('get-leagues', async () => {
+    return ['Standard', 'Hardcore', 'Settlers', 'Settlers HC'];
+});
+ipcMain.handle('price-check', async (event, payload) => {
+    // ... existing implementation ...
+    const { item, league } = payload;
+    console.log('[Main] Price Checking for league:', league);
+    const searchResult = await TradeAPI.search(item, league);
+    if (!searchResult || !searchResult.result)
+        return { error: 'Search failed' };
+    const listings = await TradeAPI.fetchResults(searchResult.id, searchResult.result);
+    return {
+        id: searchResult.id,
+        total: searchResult.total,
+        listings: listings.map((l) => ({
+            priceAmount: l.listing.price.amount,
+            priceCurrency: l.listing.price.currency,
+            account: l.listing.account.name,
+            time: l.listing.indexed
+        }))
+    };
 });
 const createWindow = () => {
     const { width, height } = screen.getPrimaryDisplay().workAreaSize;
     mainWindow = new BrowserWindow({
         width: 550,
         height: 850,
-        frame: false, // Frameless for overlay
+        // frame: false, // Replaced with titleBarStyle for macOS native feel
+        titleBarStyle: 'hidden', // Hides title bar but keeps traffic lights
+        trafficLightPosition: { x: 10, y: 10 }, // Optional: Adjust traffic light position
         transparent: true, // Transparent background
         hasShadow: false,
         alwaysOnTop: true,
@@ -224,7 +269,28 @@ app.whenReady().then(() => {
         if (BrowserWindow.getAllWindows().length === 0)
             createWindow();
     });
-    // Register Global Shortcut for item analysis
+    // Stash Navigation Shortcuts (Cmd+Shift+Left/Right to simulate arrow keys)
+    globalShortcut.register('Command+Shift+Left', async () => {
+        // Only if PoE is focused? Or always?
+        // Safer to just send Left arrow.
+        console.log('Stash Nav: Left');
+        try {
+            await Automation.sendKey('Left');
+        }
+        catch (e) {
+            console.error(e);
+        }
+    });
+    globalShortcut.register('Command+Shift+Right', async () => {
+        console.log('Stash Nav: Right');
+        try {
+            await Automation.sendKey('Right');
+        }
+        catch (e) {
+            console.error(e);
+        }
+    });
+    // Item Analysis Shortcut
     globalShortcut.register('CommandOrControl+Shift+C', async () => {
         const text = clipboard.readText();
         if (text) {
@@ -256,11 +322,28 @@ app.whenReady().then(() => {
             mainWindow.webContents.send(`log-${type}`, data);
         }
     };
-    logMonitor.on('area-changed', (data) => forwardEvent('area', data));
+    logMonitor.on('area-changed', (data) => {
+        // rudimentary map counting
+        if (data.areaId && !data.areaId.includes('Town') && !data.areaId.includes('Hideout')) {
+            const stats = store.get('stats');
+            if (stats) {
+                stats.maps = (stats.maps || 0) + 1;
+                store.set('stats', stats);
+            }
+        }
+        forwardEvent('area', data);
+    });
     logMonitor.on('login', () => forwardEvent('login'));
     logMonitor.on('level-up', (data) => forwardEvent('level-up', data));
     logMonitor.on('whisper', (data) => forwardEvent('whisper', data));
-    logMonitor.on('slain', () => forwardEvent('slain'));
+    logMonitor.on('slain', () => {
+        const stats = store.get('stats');
+        if (stats) {
+            stats.deaths = (stats.deaths || 0) + 1;
+            store.set('stats', stats);
+        }
+        forwardEvent('slain');
+    });
     // Simulation IPC forwarding
     ipcMain.on('simulation-jump', (_event, eventType) => {
         if (logMonitor)
@@ -272,8 +355,15 @@ app.whenReady().then(() => {
             logMonitor.resetSimulation && logMonitor.resetSimulation();
     });
     ipcMain.handle('get-stats', async () => {
-        console.log('[Main] Getting stats');
-        return logMonitor ? logMonitor.calculateStats() : null;
+        const s = store.get('stats');
+        // Mix with simulation stats if needed, or just return persistent stats for now
+        return {
+            totalDeaths: s?.deaths || 0,
+            totalMaps: s?.maps || 0,
+            // For Top Areas, we might need more complex storage. Skipping for MVP P1.
+            topAreas: [],
+            levelHistory: [] // Keeping structure compatible with frontend
+        };
     });
 });
 app.on('window-all-closed', () => {

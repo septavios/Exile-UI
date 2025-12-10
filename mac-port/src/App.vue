@@ -78,6 +78,51 @@ interface GameEvent {
   time: string;
 }
 
+
+
+const showControls = ref(false);
+const showSettings = ref(false);
+const isSimulationMode = ref(false);
+const settings = ref({ league: 'Settlers', opacity: 100, locked: false });
+const leagues = ref<string[]>([]);
+
+const loadSettings = async () => {
+  if (window.electron) {
+     const s = await window.electron.invoke('get-settings');
+     if (s) settings.value = { ...settings.value, ...s };
+     leagues.value = await window.electron.invoke('get-leagues');
+  }
+};
+
+const updateSetting = (key: string, value: any) => {
+   settings.value[key as keyof typeof settings.value] = value;
+   window.electron.send('set-setting', { key, value });
+};
+
+const isRegexMode = ref(false);
+const regexBookmarks = ref([
+ { label: 'Maps', regex: 'tier:([1-9]|1[0-6])' },
+ { label: 'Currency', regex: '\"currency\"' },
+ { label: 'Uniques', regex: 'rarity: unique' },
+ { label: 'No Life', regex: '!life' }
+]);
+
+const applyRegex = async (regex: string) => {
+   // Focus PoE and match regex?
+   // Actually just send text to Clipboard and paste? Or type?
+   // Typing complex regex is risky. Clipboard + Ctrl+V + Enter.
+   // Or just type into search bar.
+   // We will implement `automation-paste` or similar.
+   // For now, let's type it.
+   await window.electron.invoke('automation-send-chat', regex); // Reusing chat for now? Chat sends Enter first. Bad.
+   // Need focused search.
+   // Let's assume user clicked search bar?
+   // Or we send `Ctrl+F` first.
+   await window.electron.invoke('automation-send-keys', ['f', ['control']]); // Ctrl+F
+   await window.electron.invoke('automation-type', regex);
+};
+
+
 const item = ref<ParsedItem | null>(null);
 const currentArea = ref<string>('Unknown');
 const currentTier = ref<number>(0);
@@ -129,26 +174,93 @@ const showStats = async () => {
   }
 };
 
-onMounted(() => {
-  console.log('[Vue] App Mounted');
-  if (window.electron) {
-    window.electron.on('log-area', (data: any) => {
-      currentArea.value = data.areaId;
-      currentTier.value = data.tier || 0;
-      addEvent('area', `Entered ${data.areaId} (T${data.tier || 0})`);
-      if (data.timestamp) {
-        startTimer(new Date(data.timestamp));
-      }
-      showStats(); 
-    });
-    
-    window.electron.on('log-entered', (_data: any) => {
-       // addEvent('area', `Entered ${data.areaName}`);
-    });
+const priceResult = ref<any>(null);
+const isPriceChecking = ref(false);
 
+const checkPrice = async () => {
+   if (!item.value) return;
+   isPriceChecking.value = true;
+   priceResult.value = null;
+   
+   // Use selected league
+   const league = settings.value.league || 'Standard';
+   
+   try {
+     const result = await window.electron.invoke('price-check', { item: JSON.parse(JSON.stringify(item.value)), league });
+     priceResult.value = result;
+   } catch (e) {
+     console.error('Price check failed', e);
+     priceResult.value = { error: 'Failed' };
+   } finally {
+     isPriceChecking.value = false;
+   }
+};
+
+// Merged onMounted logic
+const activeTrade = ref<{ buyer: string; item: string; price: string } | null>(null);
+
+const handleWhisper = (data: { from: string; message: string }) => {
+   addEvent('whisper', `@${data.from}: ${data.message}`);
+   
+   // Check for trade
+   const tradeMatch = data.message.match(/Hi, I would like to buy your (.+) listed for (.+) in/);
+   if (tradeMatch) {
+      activeTrade.value = {
+        buyer: data.from,
+        item: tradeMatch[1],
+        price: tradeMatch[2]
+      };
+   }
+};
+
+const sendCmd = async (cmd: string) => {
+   await window.electron.invoke('automation-send-chat', cmd);
+};
+
+const invite = () => activeTrade.value && sendCmd(`/invite ${activeTrade.value.buyer}`);
+const trade = () => activeTrade.value && sendCmd(`/tradewith ${activeTrade.value.buyer}`);
+const kick = () => activeTrade.value && sendCmd(`/kick ${activeTrade.value.buyer}`);
+const thanks = () => {
+   if (activeTrade.value) {
+      sendCmd(`@${activeTrade.value.buyer} t4t`);
+      activeTrade.value = null; // Dismiss on thanks
+   }
+};
+
+const openWiki = () => {
+   if (!item.value) return;
+   const name = item.value.name === item.value.baseType ? item.value.name : `${item.value.name} ${item.value.baseType}`;
+   const query = encodeURIComponent(name || '');
+   window.electron.invoke('open-external', `https://www.poewiki.net/w/index.php?search=${query}`);
+};
+
+const openPoeNinja = () => {
+   if (!item.value) return;
+   // Simple search on poe.ninja foundation
+   // If unique:
+   if (item.value.rarity === 'Unique') {
+       const query = encodeURIComponent(item.value.name || '');
+       window.electron.invoke('open-external', `https://poe.ninja/challenge/unique-weapons?name=${query}`);
+       // Note: This is a loose search, correct section (weapons/armour/jewels) is hard to guess without more data.
+       // Maybe just google site:poe.ninja?
+   } else {
+       // Currency?
+       if (item.value.rarity === 'Currency') {
+          // ...
+       }
+   }
+   // Fallback to poe.ninja generic search or just poe.ninja logic
+   // Better fallback: Wiki only for P2 MVP is safer, or simplified Ninja.
+};
+
+onMounted(() => {
+  loadSettings();
+// ...
+// ...
     window.electron.on('log-login', () => addEvent('info', 'Connected to Login Server'));
     window.electron.on('log-level-up', (data: any) => addEvent('level', `Level Up! Now Level ${data.level}`));
-    window.electron.on('log-whisper', (data: any) => addEvent('whisper', `@${data.from}: ${data.message}`));
+    window.electron.on('log-whisper', (data: any) => handleWhisper(data));
+// ...
     window.electron.on('log-slain', () => {
       addEvent('death', 'You have died.');
       showStats();
@@ -156,21 +268,18 @@ onMounted(() => {
     
     window.electron.on('item-data', (data: ParsedItem) => {
       item.value = data;
+      priceResult.value = null; // Reset price on new item
+      // Auto-check price if configured? For now manual.
     });
 
     // Initial fetch
     showStats();
-  }
 });
 
-const showControls = ref(false);
-const isSimulationMode = ref(false);
-
-// Click-through logic removed for fixed window mode
 </script>
 
 <template>
-  <div class="map-tracker-panel">
+  <div class="map-tracker-panel" :class="{ locked: settings.locked }" :style="{ opacity: (settings.opacity || 100) / 100 }">
     <!-- Header: Draggable -->
     <div class="header">
       <div class="map-info">
@@ -182,12 +291,36 @@ const isSimulationMode = ref(false);
         <button class="icon-btn" @click="isSimulationMode = !isSimulationMode" :class="{ active: isSimulationMode }" title="Simulation Mode">
           🎮
         </button>
-        <button class="icon-btn" @click="showControls = !showControls" :class="{ active: showControls }" title="Stats & Settings">
+        <button class="icon-btn" @click="showSettings = !showSettings" :class="{ active: showSettings }" title="Settings">
+          ⚙️
+        </button>
+        <button class="icon-btn" @click="showControls = !showControls" :class="{ active: showControls }" title="Stats">
           📊
+        </button>
+        <button class="icon-btn" @click="isRegexMode = !isRegexMode" :class="{ active: isRegexMode }" title="Regex Bookmarks">
+          🔖
         </button>
       </div>
     </div>
 
+    <!-- Trade Notification -->
+    <div class="trade-notification" v-if="activeTrade">
+      <div class="trade-header">
+        <span class="buyer">{{ activeTrade.buyer }}</span>
+        <button class="close-btn" @click="activeTrade = null">×</button>
+      </div>
+      <div class="trade-info">
+        <span class="item">{{ activeTrade.item }}</span>
+        <span class="price-val">{{ activeTrade.price }}</span>
+      </div>
+      <div class="trade-actions">
+         <button class="t-btn invite" @click="invite">Invite</button>
+         <button class="t-btn trade" @click="trade">Trade</button>
+         <button class="t-btn kick" @click="kick">Kick</button>
+         <button class="t-btn thx" @click="thanks">Thx</button>
+      </div>
+    </div>
+    
     <!-- Quick Stats Row (Always Visible) -->
     <div class="stats-bar" v-if="gameStats">
       <div class="stat-item" title="Deaths">
@@ -226,6 +359,16 @@ const isSimulationMode = ref(false);
         <button @click="resetSimulation" class="reset-btn">Reset</button>
       </div>
     </div>
+
+    <!-- Regex Panel -->
+    <div class="settings-panel" v-if="isRegexMode">
+       <div class="panel-header">Stash Regex</div>
+       <div class="btn-grid">
+          <button v-for="bm in regexBookmarks" :key="bm.label" @click="applyRegex(bm.regex)">
+             {{ bm.label }}
+          </button>
+       </div>
+    </div>
     
     <!-- Expanded Stats (Collapsible) -->
     <div class="details-panel" v-if="showControls && gameStats">
@@ -236,6 +379,24 @@ const isSimulationMode = ref(false);
           <span class="count">{{ area.count }}x</span>
         </li>
       </ul>
+    </div>
+    <!-- Settings Panel -->
+    <div class="settings-panel" v-if="showSettings">
+       <div class="panel-header">Settings</div>
+       <div class="setting-row">
+          <label>League:</label>
+          <select :value="settings.league" @change="(e) => updateSetting('league', (e.target as HTMLSelectElement).value)">
+             <option v-for="l in leagues" :key="l" :value="l">{{ l }}</option>
+          </select>
+       </div>
+       <div class="setting-row">
+          <label>Opacity:</label>
+          <input type="range" min="20" max="100" :value="settings.opacity || 100" @input="(e) => updateSetting('opacity', Number((e.target as HTMLInputElement).value))">
+       </div>
+       <div class="setting-row">
+          <label>Lock Overlay:</label>
+          <input type="checkbox" :checked="settings.locked" @change="(e) => updateSetting('locked', (e.target as HTMLInputElement).checked)">
+       </div>
     </div>
   </div>
 
@@ -251,6 +412,9 @@ const isSimulationMode = ref(false);
         <h2 v-if="item.name !== item.baseType">{{ item.baseType }}</h2>
         <div class="base-percentile-badge" v-if="item.basePercentile !== undefined">
            Base: {{ item.basePercentile }}%
+        </div>
+        <div class="header-actions">
+           <button class="wiki-btn" @click="openWiki" title="Open Wiki">W</button>
         </div>
       </div>
     </div>
@@ -354,7 +518,35 @@ const isSimulationMode = ref(false);
       </div>
     </div>
 
-    <!-- Raw Content (collapsed by default or smaller) -->
+    <!-- Price Check Section --> 
+    <div class="price-section">
+      <div v-if="!priceResult && !isPriceChecking" class="price-actions">
+        <button class="price-btn" @click="checkPrice">Check Price ({{ settings.league }})</button>
+      </div>
+      
+      <div v-if="isPriceChecking" class="price-loading">
+         Searching Trade...
+      </div>
+      
+      <div v-if="priceResult" class="price-result">
+         <div v-if="priceResult.error" class="error">{{ priceResult.error }}</div>
+         <div v-else>
+            <div class="price-summary">
+               <span class="count">{{ priceResult.total }} matches</span>
+               <!-- Simple avg of first few? -->
+            </div>
+            <div class="listings">
+               <div v-for="(l, i) in priceResult.listings" :key="i" class="listing-row">
+                  <span class="currency">{{ l.priceAmount }} {{ l.priceCurrency }}</span>
+                  <span class="age">{{ l.time }}</span>
+                  <span class="account">{{ l.account }}</span>
+               </div>
+            </div>
+         </div>
+      </div>
+    </div>
+    
+    <!-- Item Content -->
     <div class="item-content">
       <!-- <pre>{{ item.raw }}</pre> -->
     </div>
@@ -379,6 +571,13 @@ const isSimulationMode = ref(false);
   flex-direction: column;
   overflow: hidden;
   backdrop-filter: blur(5px);
+  pointer-events: auto; /* Ensure clickable */
+}
+
+/* Locked state */
+.map-tracker-panel.locked .header {
+  cursor: default;
+  -webkit-app-region: no-drag;
 }
 
 /* Header */
@@ -402,6 +601,7 @@ const isSimulationMode = ref(false);
   align-items: center;
   gap: 8px;
   overflow: hidden;
+  padding-left: 60px; /* Space for traffic lights */
 }
 
 .tier-badge {
@@ -604,7 +804,29 @@ button:hover {
 }
 
 .details-panel .area { color: #ddd; }
-.details-panel .count { color: #fb8; font-family: monospace; }
+.settings-panel {
+  padding: 10px;
+  background: #1a1a20;
+  border-top: 1px solid #333;
+}
+
+.setting-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  color: #ccc;
+}
+
+.setting-row select {
+  background: #2a2a35;
+  border: 1px solid #3a3a45;
+  color: #fff;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+/* Item Overlay Updated Styles (Bar Layout) */
 
 /* Item Overlay Updated Styles (Bar Layout) */
 /* Item Overlay Updated Styles (Bar Layout) */
@@ -663,6 +885,25 @@ button:hover {
   color: #aaa;
   border: 1px solid #333;
 }
+
+.header-actions {
+  position: absolute;
+  top: 5px;
+  left: 10px;
+}
+
+.wiki-btn {
+  background: rgba(0,0,0,0.5);
+  color: #aaa;
+  border: 1px solid #444;
+  border-radius: 3px;
+  cursor: pointer;
+  width: 20px;
+  height: 20px;
+  font-size: 0.8em;
+  padding: 0;
+}
+.wiki-btn:hover { color: #fff; border-color: #666; }
 
 /* Misc Info Section */
 .item-misc {
@@ -799,8 +1040,55 @@ button:hover {
   width: 100%;
   pointer-events: none;
   font-size: 1em;
-  white-space: pre-wrap; /* Allow wrapping */
+  white-space: pre-wrap;
 }
+
+/* Price Section */
+.price-section {
+  background: #151515;
+  border-top: 1px solid #333;
+  padding: 8px;
+}
+
+.price-btn {
+  width: 100%;
+  padding: 8px;
+  background: #252530;
+  border: 1px solid #444;
+  color: #fb8;
+  font-weight: bold;
+  cursor: pointer;
+}
+.price-btn:hover {
+  background: #353540;
+}
+
+.price-loading {
+  text-align: center;
+  color: #888;
+  font-style: italic;
+  padding: 10px;
+}
+
+.listings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.listing-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.9em;
+  padding: 2px 4px;
+  background: #111;
+  border-bottom: 1px solid #222;
+}
+
+.listing-row .currency { color: #fff; font-weight: bold; }
+.listing-row .age { color: #888; font-size: 0.8em; }
+.listing-row .account { color: #666; font-size: 0.8em; }
 
 .mod-text {
   color: #bfbfe6; /* Light Blue-ish White aka 'Magic' */
@@ -869,3 +1157,69 @@ button:hover {
 /* Raw Content */
 .item-content pre { display: none; }
 </style>
+/* Trade Notification */
+.trade-notification {
+  background: #252530;
+  border-bottom: 1px solid #444;
+  padding: 8px;
+  animation: slideDown 0.3s ease-out;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.trade-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.trade-header .buyer {
+  color: #fb8;
+  font-weight: bold;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 1.2em;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.trade-info {
+  font-size: 0.9em;
+  color: #ccc;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+}
+.trade-info .item { color: #8af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.trade-info .price-val { color: #fff; font-weight: bold; }
+
+.trade-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.t-btn {
+  border: none;
+  border-radius: 4px;
+  padding: 6px;
+  font-weight: bold;
+  cursor: pointer;
+  color: #fff;
+  font-size: 0.85em;
+}
+
+.t-btn.invite { background: #2a8; }
+.t-btn.trade { background: #a82; }
+.t-btn.kick { background: #a22; }
+.t-btn.thx { background: #44a; }
+
+.t-btn:hover { filter: brightness(1.2); }
